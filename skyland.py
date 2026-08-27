@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-森空岛自动签到 - 青龙框架版（重构版）
+森空岛自动签到 - 青龙 / Hermes 双模式
 """
 
 import hashlib
@@ -24,6 +24,28 @@ EXIT_WHEN_FAIL = os.environ.get("EXIT_WHEN_FAIL", "off").lower() == "on"
 USE_PROXY = os.environ.get("USE_PROXY", "off").lower() == "on"
 NOTIFY_TITLE = os.environ.get("NOTIFY_TITLE", "森空岛自动签到").strip()
 
+# 运行模式：auto / qinglong / hermes
+# - auto（默认）：同目录存在 notify.py（青龙面板脚本目录自带）则走青龙模式，否则走 Hermes 模式
+# - hermes：日志走 stderr，通知改为输出到 stdout（Hermes 定时任务会原样投递）
+# - qinglong：强制青龙模式，与旧版行为完全一致
+SKYLAND_MODE = os.environ.get("SKYLAND_MODE", "auto").strip().lower()
+# Hermes 模式下可选的 token 文件（每行一个 token，# 开头为注释，兼容逗号分隔）
+SKYLAND_TOKEN_FILE = os.environ.get("SKYLAND_TOKEN_FILE", "").strip()
+# Hermes 模式：全部签到成功时静默（stdout 不输出，定时任务不投递消息）
+SKYLAND_SILENT_OK = os.environ.get("SKYLAND_SILENT_OK", "off").lower() == "on"
+
+
+def _notify_py_available():
+    return os.path.exists(os.path.join(os.path.dirname(os.path.abspath(__file__)), "notify.py"))
+
+
+def in_hermes_mode():
+    if SKYLAND_MODE == "hermes":
+        return True
+    if SKYLAND_MODE == "qinglong":
+        return False
+    return not _notify_py_available()
+
 # ======================== 常量 ========================
 APP_CODE = "4ca99fa6b56cc2ba"
 
@@ -43,7 +65,8 @@ SIGN_URL_MAPPING = {
 # ======================== 日志 ========================
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-handler = logging.StreamHandler(sys.stdout)
+# Hermes 模式：日志走 stderr，stdout 只留给最终投递内容
+handler = logging.StreamHandler(sys.stderr if in_hermes_mode() else sys.stdout)
 handler.setFormatter(logging.Formatter("%(asctime)s - %(levelname)s - %(message)s"))
 logger.addHandler(handler)
 
@@ -52,12 +75,17 @@ logger.addHandler(handler)
 import base64
 import gzip
 import uuid
+import warnings
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import padding
 from cryptography.hazmat.primitives.ciphers.algorithms import AES
 from cryptography.hazmat.decrepit.ciphers.algorithms import TripleDES
 from cryptography.hazmat.primitives.ciphers.base import Cipher
 from cryptography.hazmat.primitives.ciphers.modes import CBC, ECB
+from cryptography.utils import CryptographyDeprecationWarning
+
+# 原项目使用单键 TripleDES（8 字节），cryptography 新版会告警，功能不受影响，这里静默
+warnings.filterwarnings("ignore", category=CryptographyDeprecationWarning)
 
 # 查询dId请求头
 devices_info_url = "https://fp-it.portal101.cn/deviceprofile/v4"
@@ -275,16 +303,36 @@ def parse_user_token(t):
         return t
 
 
-def read_tokens_from_env():
-    if not TOKEN_ENV:
-        return []
+def _parse_token_list(items):
     v = []
-    for i in TOKEN_ENV.split(","):
+    for i in items:
         i = i.strip()
         if i and i not in v:
             v.append(parse_user_token(i))
-    logger.info(f"从环境变量 SKYLAND_TOKENS 读取到 {len(v)} 个 token")
     return v
+
+
+def read_tokens():
+    """读取 token：环境变量 SKYLAND_TOKENS + 可选 token 文件（SKYLAND_TOKEN_FILE）合并去重。"""
+    raw = []
+    if TOKEN_ENV:
+        raw.extend(TOKEN_ENV.split(","))
+    if SKYLAND_TOKEN_FILE:
+        path = os.path.expanduser(SKYLAND_TOKEN_FILE)
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    raw.extend(line.split(","))
+        else:
+            logger.warning(f"token 文件不存在：{path}")
+    tokens = _parse_token_list(raw)
+    if tokens:
+        src = "环境变量 + token 文件" if (TOKEN_ENV and SKYLAND_TOKEN_FILE) else ("环境变量" if TOKEN_ENV else "token 文件")
+        logger.info(f"从{src}读取到 {len(tokens)} 个 token")
+    return tokens
 
 
 def get_grant_code(token):
@@ -407,6 +455,12 @@ def do_sign(cred_resp):
 # ======================== 青龙通知（notify.py） ========================
 
 def notify(title, content):
+    # Hermes 模式：stdout 即定时任务投递内容（日志已走 stderr，这里只输出结果）
+    if in_hermes_mode():
+        if content:
+            print(f"{title}\n{content}", flush=True)
+        return
+    # 青龙模式：调用青龙面板自带的 notify.py
     try:
         sys.path.append(os.path.dirname(__file__))
         from notify import send  # 青龙自带
@@ -418,11 +472,16 @@ def notify(title, content):
 # ======================== 主入口 ========================
 
 def main():
-    logger.info("========== 森空岛自动签到（青龙版） ==========")
+    logger.info("========== 森空岛自动签到（青龙 / Hermes 双模式） ==========")
 
-    tokens = read_tokens_from_env()
+    tokens = read_tokens()
     if not tokens:
-        logger.error("SKYLAND_TOKENS 环境变量为空，无法签到")
+        logger.error("SKYLAND_TOKENS 与 token 文件均为空，无法签到")
+        if in_hermes_mode():
+            print(
+                f"{NOTIFY_TITLE} - {date.today().strftime('%Y-%m-%d')}\n未配置任何 token（SKYLAND_TOKENS 或 SKYLAND_TOKEN_FILE 为空），请检查配置",
+                flush=True,
+            )
         if EXIT_WHEN_FAIL:
             sys.exit(1)
         return False
@@ -447,8 +506,12 @@ def main():
     cost = (time.time() - start_time) * 1000
     logger.info(f"签到完成，耗时 {cost:.2f}ms")
 
-    # 通知
-    notify(f"{NOTIFY_TITLE} - {date.today().strftime('%Y-%m-%d')}", "\n".join(all_logs))
+    # 通知：Hermes 模式全部成功且 SKYLAND_SILENT_OK=on 时静默（stdout 为空，定时任务不投递）
+    has_failure = any("失败" in line for line in all_logs)
+    if in_hermes_mode() and SKYLAND_SILENT_OK and not has_failure:
+        logger.info("全部签到成功，SKYLAND_SILENT_OK=on，本次静默不输出")
+    else:
+        notify(f"{NOTIFY_TITLE} - {date.today().strftime('%Y-%m-%d')}", "\n".join(all_logs))
 
     if EXIT_WHEN_FAIL and not success:
         sys.exit(1)
