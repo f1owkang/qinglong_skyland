@@ -271,7 +271,8 @@ HEADER_FOR_SIGN = {"platform": "3", "timestamp": "", "dId": HEADER_LOGIN["dId"],
 
 
 def generate_signature(path, body_or_query):
-    t = str(int(time.time()) - 2)
+    # 同步上游 2026-05-26 修改：yj 服务器时间戳策略已调整，直接用服务器时间原值（旧版 -2 偏移已不需要）
+    t = str(int(time.time()))
     token = http_local.token.encode("utf-8")
     header_ca = json.loads(json.dumps(HEADER_FOR_SIGN))
     header_ca["timestamp"] = t
